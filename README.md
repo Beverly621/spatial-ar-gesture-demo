@@ -9,7 +9,6 @@
 项目不需要安装本地 AI 运行环境，手势识别和人物分割由浏览器加载 MediaPipe 组件完成。启动本地服务后，在浏览器中打开页面，即可体验摄像头手势识别、人像分割和 AR 滤镜效果。
 
 原始创意来源：Instagram [@wxll.hx](https://instagram.com/wxll.hx)（无开源仓库）  
-二创：douyin@苏云绿（仅 Windows 版）
 
 ## 在线说明
 
@@ -244,4 +243,4 @@ npm start -- --port 5174
 
 本项目仅供学习与技术交流使用。
 
-原始创意来源标注为 Instagram [@wxll.hx](https://instagram.com/wxll.hx)，二创：douyin@苏云绿（仅 Windows 版）。再次开发、演示或分发时，请保留原始来源说明。
+原始创意来源标注为 Instagram [@wxll.hx](https://instagram.com/wxll.hx)。再次开发、演示或分发时，请保留原始来源说明。
