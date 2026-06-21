@@ -1,0 +1,64 @@
+name: Auto Build Release Zip
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm run setup
+
+      - name: Package clean source zip
+        run: |
+          ZIP_NAME="AR-Gesture-Demo-${{ github.ref_name }}.zip"
+          zip -r "$ZIP_NAME" . \
+            -x "node_modules/*" \
+            -x ".git/*" \
+            -x ".github/workflows/*" \
+            -x "dist/*" \
+            -x ".env" \
+            -x ".env.*" \
+            -x "*.log"
+
+      - name: Publish Release & Attach Zip
+        uses: softprops/action-gh-release@v1
+        with:
+          files: AR-Gesture-Demo-${{ github.ref_name }}.zip
+          body: |
+            # AR 手势特效跨平台版 ${{ github.ref_name }}
+
+            原始创意来源：instagram @wxll.hx
+
+            纯净源码包（不含 node_modules）。
+
+            ## 启动命令
+
+            ```bash
+            npm run setup
+            npm start
+            ```
+
+            自定义端口：
+
+            ```bash
+            npm start -- --port 5174
+            ```
+
+            > 提示：当前仅 macOS 完整测试，Windows / Linux 为跨平台兼容设计但尚未完成实机验证。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

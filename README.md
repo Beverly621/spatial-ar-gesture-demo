@@ -79,6 +79,14 @@ http://localhost:5174/
 
 端口不需要和作者、维护者或其他设备保持一致。每台电脑只要选择自己本机未被占用的端口即可。
 
+## 官方纯净安装包下载
+
+最新版压缩包：[AR-Gesture-Demo-v1.0.0.zip](https://github.com/Beverly621/spatial-ar-gesture-demo/releases/download/v1.0.0/AR-Gesture-Demo-v1.0.0.zip)
+
+所有历史版本：[前往 Releases 页面](https://github.com/Beverly621/spatial-ar-gesture-demo/releases)
+
+Release 压缩包由 GitHub Actions 自动生成，不需要维护者手动本地打包或手动上传文件。压缩包会自动剔除 `node_modules/`、`.git/`、`dist/`、`.env*`、日志文件等内容。
+
 ## 不同系统使用教程
 
 ### macOS
@@ -192,6 +200,8 @@ window.AR_GESTURE_CONFIG = {
 
 ## 打包
 
+### 本地打包
+
 ```bash
 npm run package
 ```
@@ -203,6 +213,34 @@ dist/spatial-ar-gesture-demo
 ```
 
 `dist/` 是本地交付产物，不提交到仓库。
+
+### GitHub Actions 自动打包 Release
+
+仓库内置工作流：
+
+```text
+.github/workflows/release-build.yml
+```
+
+自动触发方式：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+推送 `v*` 版本标签后，GitHub Actions 会自动：
+
+- 检出源码；
+- 安装 Node.js 20；
+- 执行 `npm run setup`；
+- 生成纯净源码 ZIP；
+- 创建 GitHub Release；
+- 将 `AR-Gesture-Demo-<tag>.zip` 挂载到 Release 附件。
+
+也可以在网页手动触发：仓库 -> `Actions` -> `Auto Build Release Zip` -> `Run workflow`。
+
+该流程使用仓库内置 `GITHUB_TOKEN`，无需额外配置 personal access token。
 
 ## 常见问题
 
