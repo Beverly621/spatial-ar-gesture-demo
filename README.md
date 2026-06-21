@@ -1,4 +1,4 @@
-# 全平台浏览器 AR 交互手势特效
+# 全平台-- AR 在线交互手势特效
 
 [![Node.js Version](https://img.shields.io/badge/node.js-%3E%3D_18.x-blue.svg)](https://nodejs.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows_%7C_macOS_%7C_Linux-lightgrey.svg)]()
