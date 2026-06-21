@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AR 手势特效 - 跨平台版</title>
+    <meta name="author" content="Original concept credited to instagram @wxll.hx">
+    <link rel="stylesheet" href="./src/styles.css">
+    <script src="./src/skills/mediapipe-loader.js"></script>
+</head>
+<body>
+
+    <!-- 隐藏的视频源 -->
+    <video id="video-element" autoplay playsinline muted></video>
+
+    <!-- 主渲染画布 -->
+    <canvas id="main-canvas"></canvas>
+
+    <!-- UI 覆盖层 -->
+    <div id="ui-layer" class="ui-layer">
+        <div class="top-actions">
+            <div id="btn-group" class="btn-group">
+                <button id="btn-start" class="glass-panel icon-button" type="button" title="启动摄像头">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                </button>
+                <button id="btn-demo" class="glass-panel icon-button" type="button" title="演示模式">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122"></path></svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div id="status-panel" class="status-panel" hidden></div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const video = document.getElementById('video-element');
+    const canvas = document.getElementById('main-canvas');
+    const ctx = canvas.getContext('2d');
+    const btnStart = document.getElementById('btn-start');
+    const btnDemo = document.getElementById('btn-demo');
+    const btnGroup = document.getElementById('btn-group');
+    const statusPanel = document.getElementById('status-panel');
+
+    function showStatus(message) {
+        statusPanel.textContent = message;
+        statusPanel.hidden = false;
+    }
+
+    function hideStatus() {
+        statusPanel.hidden = true;
+        statusPanel.textContent = "";
+    }
+
+    // ==== 滤镜依赖的离屏缓冲区 ====
+    const baseFrameCanvas = document.createElement('canvas');
+    const baseFrameCtx = baseFrameCanvas.getContext('2d', { willReadFrequently: true });
+    const frameSampleCanvas = document.createElement('canvas');
+    const frameSampleCtx = frameSampleCanvas.getContext('2d', { willReadFrequently: true });
+    const filterOutputCanvas = document.createElement('canvas');
+    const filterOutputCtx = filterOutputCanvas.getContext('2d', { willReadFrequently: true });
+    const maskCanvas = document.createElement('canvas');
+    const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+
+    let isCameraActive = false;
+    let isDemoMode = false;
+    let handsModel = null;
+    let segmentationModel = null;
+    
+    let latestHands = [];
+    let latestMaskAvailable = false;
+    
+    // 渲染区域参数 (实现 object-fit: cover 效果)
+    let rX=0, rY=0, rW=0, rH=0;
+
+    // 演示模式的控制点
+    let demoPoints = null;
+    let draggedPoint = null;
+
+    // 绿色滤镜缓存
+    const greenAlphaCache = {
+        raw: new Float32Array(0),
+        soft: new Float32Array(0),
+    };
+
+    // 调整画布尺寸
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        
+        if (video.videoWidth > 0) {
+            const vRatio = video.videoWidth / video.videoHeight;
+            const cRatio = canvas.width / canvas.height;
+            if (vRatio > cRatio) {
+                rH = canvas.height;
+                rW = rH * vRatio;
+                rX = (canvas.width - rW) / 2;
+                rY = 0;
+            } else {
+                rW = canvas.width;
+                rH = rW / vRatio;
+                rX = 0;
+                rY = (canvas.height - rH) / 2;
+            }
+        }
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    // ==== AI 模型初始化与视频流 ====
+    async function initModels() {
+        if (handsModel && segmentationModel) return;
+
+        try {
+            showStatus("正在加载手势识别与人物分割技能模块...");
+            if (!window.ARSkillLoader) {
+                throw new Error("技能加载器未就绪，请刷新页面或检查 src/skills/mediapipe-loader.js。");
+            }
+            const skillRuntime = await window.ARSkillLoader.loadMediaPipeSkills();
+            handsModel = new Hands({locateFile: (file) => skillRuntime.locateHandsFile(file)});
+            handsModel.setOptions({
+                maxNumHands: 2,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.6,
+                minTrackingConfidence: 0.6
+            });
+            handsModel.onResults((results) => {
+                latestHands = results.multiHandLandmarks || [];
+            });
+
+            segmentationModel = new SelfieSegmentation({locateFile: (file) => skillRuntime.locateSegmentationFile(file)});
+            segmentationModel.setOptions({ modelSelection: 1 });
+            segmentationModel.onResults((results) => {
+                // 1:1 映射到全屏画布维度以供 filter helpers 精确采样
+                if (maskCanvas.width !== canvas.width || maskCanvas.height !== canvas.height) {
+                    maskCanvas.width = canvas.width;
+                    maskCanvas.height = canvas.height;
+                }
+                maskCtx.save();
+                maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+                maskCtx.translate(canvas.width, 0);
+                maskCtx.scale(-1, 1);
+                
+                // 【优化人物边缘锯齿】
+                // 1. 开启高质量图像平滑
+                maskCtx.imageSmoothingEnabled = true;
+                maskCtx.imageSmoothingQuality = "high";
+                // 2. 利用 GPU 硬件加速，根据屏幕宽度动态计算羽化半径（至少3px，抵消 MediaPipe 低分辨率硬边缘）
+                const blurRadius = Math.max(3, canvas.width * 0.005);
+                maskCtx.filter = `blur(${blurRadius}px)`;
+                
+                maskCtx.drawImage(results.segmentationMask, canvas.width - rX - rW, rY, rW, rH);
+                maskCtx.restore();
+                latestMaskAvailable = true;
+            });
+            hideStatus();
+        } catch (e) {
+            console.error("AI 模型加载失败:", e);
+            showStatus(`AI 技能模块加载失败：${e.message || e}`);
+            throw e;
+        }
+    }
+
+    btnStart.addEventListener('click', async () => {
+        if (isCameraActive) return;
+        isDemoMode = false;
+        await initModels();
+        
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }
+            });
+            video.srcObject = stream;
+            
+            video.onloadedmetadata = () => {
+                video.width = video.videoWidth;
+                video.height = video.videoHeight;
+                video.play();
+                isCameraActive = true;
+                btnGroup.style.opacity = '0';
+                setTimeout(() => btnGroup.style.display = 'none', 500);
+                resizeCanvas();
+                processVideoLoop();
+                requestAnimationFrame(renderLoop);
+            };
+        } catch (err) {
+            console.error("摄像头访问被拒绝或不可用:", err);
+            showStatus(`摄像头无法启动：${err.message || err}`);
+        }
+    });
+
+    btnDemo.addEventListener('click', () => {
+        hideStatus();
+        isDemoMode = true;
+        btnGroup.style.opacity = '0';
+        setTimeout(() => btnGroup.style.display = 'none', 500);
+        resizeCanvas();
+        
+        const cw = canvas.width, ch = canvas.height;
+        demoPoints = {
+            l_thumb: { x: cw * 0.25, y: ch * 0.4 },
+            l_index: { x: cw * 0.35, y: ch * 0.3 },
+            l_middle: { x: cw * 0.45, y: ch * 0.25 },
+            l_pinky: { x: cw * 0.50, y: ch * 0.4 },
+            r_thumb: { x: cw * 0.75, y: ch * 0.4 },
+            r_index: { x: cw * 0.65, y: ch * 0.3 },
+            r_middle: { x: cw * 0.55, y: ch * 0.25 },
+            r_pinky: { x: cw * 0.60, y: ch * 0.4 },
+        };
+
+        if (!isCameraActive) {
+            requestAnimationFrame(renderLoop);
+        }
+    });
+
+    let lastVideoTime = -1;
+    let isProcessing = false;
+    async function processVideoLoop() {
+        if (!isCameraActive || isDemoMode) {
+            if (isCameraActive) setTimeout(processVideoLoop, 200);
+            return;
+        }
+        if (video.currentTime !== lastVideoTime && video.videoWidth > 0 && !isProcessing) {
+            lastVideoTime = video.currentTime;
+            isProcessing = true;
+            try {
+                await handsModel.send({image: video});
+                await segmentationModel.send({image: video});
+            } catch (e) { 
+                console.warn("Model inference skip frame:", e); 
+            } finally {
+                isProcessing = false;
+            }
+        }
+        requestAnimationFrame(processVideoLoop); 
+    }
+
+    function mapPoint(normX, normY) {
+        const mirrorX = 1.0 - normX;
+        return { x: rX + mirrorX * rW, y: rY + normY * rH };
+    }
+
+    // ==== Shared Filter Helpers ====
+    function drawImageDataClipped(imageData, bounds, points, filter = "none") {
+        if (filterOutputCanvas.width !== imageData.width || filterOutputCanvas.height !== imageData.height) {
+            filterOutputCanvas.width = imageData.width;
+            filterOutputCanvas.height = imageData.height;
+        }
+        filterOutputCtx.putImageData(imageData, 0, 0);
+
+        ctx.save();
+        makePath(points);
+        ctx.clip();
+        ctx.filter = filter;
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(filterOutputCanvas, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+        ctx.filter = "none";
+        ctx.restore();
+    }
+
+    function samplePixel(imageData, width, height, x, y) {
+        const sx = Math.min(Math.max(Math.floor(x), 0), width - 1);
+        const sy = Math.min(Math.max(Math.floor(y), 0), height - 1);
+        const index = (sy * width + sx) * 4;
+        return {
+            r: imageData.data[index],
+            g: imageData.data[index + 1],
+            b: imageData.data[index + 2],
+        };
+    }
+
+    function getBaseFrameSample(bounds, maxWidth = 520) {
+        const width = bounds.right - bounds.left;
+        const height = bounds.bottom - bounds.top;
+        const sourceX = Math.floor((bounds.left / canvas.width) * baseFrameCanvas.width);
+        const sourceY = Math.floor((bounds.top / canvas.height) * baseFrameCanvas.height);
+        const sourceWidth = Math.max(1, Math.ceil((width / canvas.width) * baseFrameCanvas.width));
+        const sourceHeight = Math.max(1, Math.ceil((height / canvas.height) * baseFrameCanvas.height));
+        const sx = Math.min(Math.max(sourceX, 0), baseFrameCanvas.width - 1);
+        const sy = Math.min(Math.max(sourceY, 0), baseFrameCanvas.height - 1);
+        const sw = Math.min(sourceWidth, baseFrameCanvas.width - sx);
+        const sh = Math.min(sourceHeight, baseFrameCanvas.height - sy);
+        const scale = Math.min(1, maxWidth / Math.max(1, sw));
+        const sampleWidth = Math.max(1, Math.round(sw * scale));
+        const sampleHeight = Math.max(1, Math.round(sh * scale));
+
+        if (frameSampleCanvas.width !== sampleWidth || frameSampleCanvas.height !== sampleHeight) {
+            frameSampleCanvas.width = sampleWidth;
+            frameSampleCanvas.height = sampleHeight;
+        }
+        frameSampleCtx.clearRect(0, 0, sampleWidth, sampleHeight);
+        frameSampleCtx.imageSmoothingEnabled = true;
+        frameSampleCtx.imageSmoothingQuality = "high";
+        frameSampleCtx.drawImage(baseFrameCanvas, sx, sy, sw, sh, 0, 0, sampleWidth, sampleHeight);
+        return frameSampleCtx.getImageData(0, 0, sampleWidth, sampleHeight);
+    }
+
+    function sampleSoftPixel(imageData, width, height, x, y, radius) {
+        const taps = [
+            samplePixel(imageData, width, height, x, y),
+            samplePixel(imageData, width, height, x - radius, y),
+            samplePixel(imageData, width, height, x + radius, y),
+            samplePixel(imageData, width, height, x, y - radius),
+            samplePixel(imageData, width, height, x, y + radius),
+        ];
+        return taps.reduce(
+            (sum, color) => ({
+                r: sum.r + color.r / taps.length,
+                g: sum.g + color.g / taps.length,
+                b: sum.b + color.b / taps.length,
+            }), { r: 0, g: 0, b: 0 }
+        );
+    }
+
+    function luminance(r, g, b) {
+        return (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+    }
+
+    function mixColor(a, b, amount) {
+        const t = Math.min(Math.max(amount, 0), 1);
+        return {
+            r: Math.round(a.r + (b.r - a.r) * t),
+            g: Math.round(a.g + (b.g - a.g) * t),
+            b: Math.round(a.b + (b.b - a.b) * t),
+        };
+    }
+
+    function sampleLuma(imageData, x, y) {
+        const index = (y * imageData.width + x) * 4;
+        return (imageData.data[index] * 0.2126 + imageData.data[index + 1] * 0.7152 + imageData.data[index + 2] * 0.0722) / 255;
+    }
+
+    function smoothStep(edge0, edge1, value) {
+        const t = Math.min(Math.max((value - edge0) / (edge1 - edge0), 0), 1);
+        return t * t * (3 - 2 * t);
+    }
+
+    function levels(value, blackPoint, whitePoint) {
+        return Math.min(Math.max((value - blackPoint) / (whitePoint - blackPoint), 0), 1);
+    }
+
+    function personMaskAt(x, y, maskSample) {
+        if (!latestMaskAvailable || !maskSample) return 0;
+        const sx = Math.min(Math.max((x / canvas.width) * (maskCanvas.width - 1), 0), maskCanvas.width - 1);
+        const sy = Math.min(Math.max((y / canvas.height) * (maskCanvas.height - 1), 0), maskCanvas.height - 1);
+        const x0 = Math.floor(sx);
+        const y0 = Math.floor(sy);
+        const x1 = Math.min(x0 + 1, maskCanvas.width - 1);
+        const y1 = Math.min(y0 + 1, maskCanvas.height - 1);
+        const tx = sx - x0;
+        const ty = sy - y0;
+        const top = sampleMaskPixel(maskSample, x0, y0) * (1 - tx) + sampleMaskPixel(maskSample, x1, y0) * tx;
+        const bottom = sampleMaskPixel(maskSample, x0, y1) * (1 - tx) + sampleMaskPixel(maskSample, x1, y1) * tx;
+        return top * (1 - ty) + bottom * ty;
+    }
+
+    function sampleMaskPixel(maskSample, x, y) {
+        const index = (y * maskCanvas.width + x) * 4;
+        return maskSample.data[index] / 255;
+    }
+
+    function softPersonMaskAt(x, y, maskSample, radius) {
+        const center = personMaskAt(x, y, maskSample) * 0.44;
+        const near =
+            (personMaskAt(x - radius * 0.45, y, maskSample) +
+            personMaskAt(x + radius * 0.45, y, maskSample) +
+            personMaskAt(x, y - radius * 0.45, maskSample) +
+            personMaskAt(x, y + radius * 0.45, maskSample)) * 0.14;
+        return center + near;
+    }
+
+    function dotNoise(x, y) {
+        return seededNoise(x * 0.173 + y * 0.619);
+    }
+
+    function pointInPolygon(point, polygon) {
+        let inside = false;
+        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+            const current = polygon[i];
+            const previous = polygon[j];
+            const intersects =
+                current.y > point.y !== previous.y > point.y &&
+                point.x < ((previous.x - current.x) * (point.y - current.y)) / (previous.y - current.y) + current.x;
+            if (intersects) inside = !inside;
+        }
+        return inside;
+    }
+
+    function clampBounds(bounds) {
+        return {
+            left: Math.max(0, Math.floor(bounds.left)),
+            top: Math.max(0, Math.floor(bounds.top)),
+            right: Math.min(canvas.width, Math.ceil(bounds.right)),
+            bottom: Math.min(canvas.height, Math.ceil(bounds.bottom)),
+        };
+    }
+
+    function makePath(points) {
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+        ctx.closePath();
+    }
+
+    function polygonBounds(points) {
+        return points.reduce(
+            (bounds, point) => ({
+                left: Math.min(bounds.left, point.x),
+                right: Math.max(bounds.right, point.x),
+                top: Math.min(bounds.top, point.y),
+                bottom: Math.max(bounds.bottom, point.y),
+            }),
+            { left: Infinity, right: -Infinity, top: Infinity, bottom: -Infinity },
+        );
+    }
+
+    function seededNoise(value) {
+        return Math.sin(value) * 43758.5453 - Math.floor(Math.sin(value) * 43758.5453);
+    }
+
+    // ==== Blue Filter ====
+    function drawBlueThermalFilter(points, maskSample) {
+        const bounds = clampBounds(polygonBounds(points));
+        if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
+
+        drawBluePlaneFill(points, bounds);
+
+        const source = getBaseFrameSample(bounds, 560);
+        const width = source.width;
+        const height = source.height;
+        const boundsWidth = bounds.right - bounds.left;
+        const boundsHeight = bounds.bottom - bounds.top;
+        const output = ctx.createImageData(width, height);
+
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const canvasX = bounds.left + (x / width) * boundsWidth;
+                const canvasY = bounds.top + (y / height) * boundsHeight;
+                const outIndex = (y * width + x) * 4;
+                if (!pointInPolygon({ x: canvasX, y: canvasY }, points)) {
+                    output.data[outIndex + 3] = 0;
+                    continue;
+                }
+
+                const subject = softPersonMaskAt(canvasX, canvasY, maskSample, 6);
+                const body = smoothStep(0.12, 0.66, subject);
+                if (body <= 0.01) {
+                    output.data[outIndex + 3] = 0;
+                    continue;
+                }
+
+                const src = sampleSoftPixel(source, width, height, x, y, 0.65);
+                const luma = smoothStep(0.08, 0.9, luminance(src.r, src.g, src.b));
+                const fineNoise = (dotNoise(canvasX * 8.1, canvasY * 9.7) - 0.5) * 0.105;
+                const microGrain = (dotNoise(canvasX * 25.3, canvasY * 21.9) - 0.5) * 0.025;
+                const contrastLuma = Math.min(1, Math.max(0, luma * body + fineNoise + microGrain));
+                const highlight = smoothStep(0.5, 0.64, contrastLuma);
+                const midTone = smoothStep(0.34, 0.58, contrastLuma) * (1 - highlight) * 0.42;
+                let base = mixColor({ r: 18, g: 62, b: 102 }, { r: 250, g: 252, b: 255 }, highlight);
+                base = mixColor(base, { r: 60, g: 133, b: 190 }, midTone);
+                const grain = (dotNoise(canvasX * 31.7, canvasY * 29.3) - 0.5) * 5;
+                base = {
+                    r: Math.min(255, Math.max(0, Math.round(base.r + grain))),
+                    g: Math.min(255, Math.max(0, Math.round(base.g + grain))),
+                    b: Math.min(255, Math.max(0, Math.round(base.b + grain))),
+                };
+
+                output.data[outIndex] = base.r;
+                output.data[outIndex + 1] = base.g;
+                output.data[outIndex + 2] = base.b;
+                output.data[outIndex + 3] = Math.round(255 * smoothStep(0.04, 0.78, body));
+            }
+        }
+        drawImageDataClipped(output, bounds, points);
+    }
+
+    function drawBluePlaneFill(points, bounds) {
+        ctx.save();
+        makePath(points);
+        ctx.clip();
+
+        ctx.fillStyle = "#113351";
+        ctx.fillRect(bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+
+        ctx.globalCompositeOperation = "screen";
+        ctx.globalAlpha = 0.04;
+        ctx.fillStyle = "#cceeff";
+        ctx.beginPath();
+        ctx.ellipse(
+            bounds.left + (bounds.right - bounds.left) * 0.68,
+            bounds.top + (bounds.bottom - bounds.top) * 0.28,
+            Math.max(24, (bounds.right - bounds.left) * 0.42),
+            Math.max(14, (bounds.bottom - bounds.top) * 0.55),
+            -0.2, 0, Math.PI * 2
+        );
+        ctx.fill();
+
+        ctx.globalCompositeOperation = "source-over";
+        ctx.globalAlpha = 0.08;
+        ctx.fillStyle = "#ffffff";
+        drawBlueFineNoise(points, bounds);
+        ctx.restore();
+    }
+
+    function drawBlueFineNoise(points, bounds) {
+        const density = Math.max(140, Math.min(520, Math.floor(((bounds.right - bounds.left) * (bounds.bottom - bounds.top)) / 700)));
+        ctx.globalCompositeOperation = "screen";
+        for (let i = 0; i < density; i += 1) {
+            const nx = dotNoise(i * 7.13, bounds.left * 0.11);
+            const ny = dotNoise(i * 11.71, bounds.top * 0.17);
+            const x = bounds.left + nx * (bounds.right - bounds.left);
+            const y = bounds.top + ny * (bounds.bottom - bounds.top);
+            if (!pointInPolygon({ x, y }, points)) continue;
+            const alpha = 0.006 + dotNoise(x * 2.1, y * 1.7) * 0.016;
+            ctx.fillStyle = `rgba(226, 244, 255, ${alpha})`;
+            ctx.fillRect(x, y, 0.45, 0.45);
+        }
+    }
+
+    // ==== Green Filter ====
+    function drawGreenGhostFilter(points, maskSample) {
+        const bounds = clampBounds(polygonBounds(points));
+        if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
+
+        drawGreenPlaneFill(points, bounds);
+
+        const source = getBaseFrameSample(bounds, 760);
+        const width = source.width;
+        const height = source.height;
+        const boundsWidth = bounds.right - bounds.left;
+        const boundsHeight = bounds.bottom - bounds.top;
+        const output = ctx.createImageData(width, height);
+        const alphaSize = width * height;
+        if (greenAlphaCache.raw.length !== alphaSize) {
+            greenAlphaCache.raw = new Float32Array(alphaSize);
+            greenAlphaCache.soft = new Float32Array(alphaSize);
+        } else {
+            greenAlphaCache.raw.fill(0);
+            greenAlphaCache.soft.fill(0);
+        }
+        const rawAlpha = greenAlphaCache.raw;
+        const softAlpha = greenAlphaCache.soft;
+
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const canvasX = bounds.left + ((x + 0.5) / width) * boundsWidth;
+                const canvasY = bounds.top + ((y + 0.5) / height) * boundsHeight;
+                const index = y * width + x;
+                if (!pointInPolygon({ x: canvasX, y: canvasY }, points)) {
+                    rawAlpha[index] = 0;
+                    continue;
+                }
+                rawAlpha[index] = greenSubjectSeedAt(canvasX, canvasY, maskSample);
+            }
+        }
+
+        boxBlurFloat(rawAlpha, softAlpha, width, height, Math.max(1, Math.round(Math.min(width, height) * 0.004)), 2);
+
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const canvasX = bounds.left + ((x + 0.5) / width) * boundsWidth;
+                const canvasY = bounds.top + ((y + 0.5) / height) * boundsHeight;
+                const outIndex = (y * width + x) * 4;
+                if (!pointInPolygon({ x: canvasX, y: canvasY }, points)) {
+                    output.data[outIndex + 3] = 0;
+                    continue;
+                }
+
+                const color = sampleSoftPixel(source, width, height, x, y, 0.45);
+                const lum = smoothStep(0.12, 0.82, luminance(color.r, color.g, color.b));
+                const alphaIndex = y * width + x;
+                const baseMask = rawAlpha[alphaIndex];
+                const featherMask = softAlpha[alphaIndex];
+                const body = Math.min(1, smoothStep(0.055, 0.78, featherMask) * (0.72 + smoothStep(0.06, 0.58, baseMask) * 0.28));
+                if (body <= 0.004) {
+                    output.data[outIndex + 3] = 0;
+                    continue;
+                }
+
+                const printNoise = (dotNoise(canvasX * 13.3, canvasY * 14.7) - 0.5) * 0.018;
+                const microGrain = (dotNoise(canvasX * 37.1, canvasY * 33.7) - 0.5) * 0.004;
+                const paperNoise = dotNoise(canvasX * 23.1, canvasY * 19.7) * 0.016;
+                const printLuma = Math.min(1, Math.max(0, lum + printNoise + microGrain));
+                const shadowInk = 1 - smoothStep(0.32, 0.74, printLuma);
+                const ink = Math.min(1, Math.max(0, shadowInk * Math.pow(body, 0.96)));
+                const chroma = greenSoftChromaEdge(x, y, softAlpha, width, height, boundsWidth);
+                let mapped = greenSilkscreenColor(ink, paperNoise);
+                mapped = mixColor(mapped, { r: 214, g: 24, b: 52 }, chroma.red * 0.92);
+                mapped = mixColor(mapped, { r: 24, g: 62, b: 220 }, chroma.blue * 0.92);
+
+                output.data[outIndex] = mapped.r;
+                output.data[outIndex + 1] = mapped.g;
+                output.data[outIndex + 2] = mapped.b;
+                output.data[outIndex + 3] = Math.round(250 * Math.max(body, chroma.red * 0.42, chroma.blue * 0.42));
+            }
+        }
+        drawImageDataClipped(output, bounds, points, "blur(0.35px)");
+    }
+
+    function greenSubjectSeedAt(canvasX, canvasY, maskSample) {
+        const center = personMaskAt(canvasX, canvasY, maskSample) * 0.34;
+        const nearRadius = 1.35;
+        const diagonalRadius = 2.1;
+        const near =
+            (personMaskAt(canvasX - nearRadius, canvasY, maskSample) +
+            personMaskAt(canvasX + nearRadius, canvasY, maskSample) +
+            personMaskAt(canvasX, canvasY - nearRadius, maskSample) +
+            personMaskAt(canvasX, canvasY + nearRadius, maskSample)) * 0.105;
+        const diagonal =
+            (personMaskAt(canvasX - diagonalRadius, canvasY - diagonalRadius, maskSample) +
+            personMaskAt(canvasX + diagonalRadius, canvasY - diagonalRadius, maskSample) +
+            personMaskAt(canvasX - diagonalRadius, canvasY + diagonalRadius, maskSample) +
+            personMaskAt(canvasX + diagonalRadius, canvasY + diagonalRadius, maskSample)) * 0.06;
+        return smoothStep(0.08, 0.72, center + near + diagonal);
+    }
+
+    function greenSoftChromaEdge(x, y, alphaField, width, height, boundsWidth) {
+        const shift = Math.max(1.4, Math.min(4.6, (4.8 / Math.max(1, boundsWidth)) * width));
+        const center = sampleFloatField(alphaField, width, height, x, y);
+        const redShift = sampleFloatField(alphaField, width, height, x + shift, y);
+        const blueShift = sampleFloatField(alphaField, width, height, x - shift, y);
+        const left = sampleFloatField(alphaField, width, height, x - 1.4, y);
+        const right = sampleFloatField(alphaField, width, height, x + 1.4, y);
+        const up = sampleFloatField(alphaField, width, height, x, y - 1.4);
+        const down = sampleFloatField(alphaField, width, height, x, y + 1.4);
+        const gradient = Math.abs(right - left) + Math.abs(down - up);
+        const edgeBand = smoothStep(0.035, 0.32, center) * (1 - smoothStep(0.64, 0.9, center));
+        const edgeGate = Math.min(1, edgeBand * (0.62 + smoothStep(0.018, 0.16, gradient) * 0.72));
+        return {
+            red: Math.min(1, Math.max(0, (redShift - center) * 1.8 + edgeBand * gradient * 0.82) * edgeGate),
+            blue: Math.min(1, Math.max(0, (blueShift - center) * 1.8 + edgeBand * gradient * 0.82) * edgeGate),
+        };
+    }
+
+    function boxBlurFloat(source, target, width, height, radius, passes = 1) {
+        if (radius <= 0) { target.set(source); return; }
+        let read = source;
+        if (!boxBlurFloat.scratch || boxBlurFloat.scratch.length !== source.length) {
+            boxBlurFloat.scratch = new Float32Array(source.length);
+        }
+        const scratch = boxBlurFloat.scratch;
+        for (let pass = 0; pass < passes; pass += 1) {
+            for (let y = 0; y < height; y += 1) {
+                for (let x = 0; x < width; x += 1) {
+                    let total = 0, count = 0;
+                    for (let offset = -radius; offset <= radius; offset += 1) {
+                        const sx = Math.min(width - 1, Math.max(0, x + offset));
+                        total += read[y * width + sx];
+                        count += 1;
+                    }
+                    scratch[y * width + x] = total / count;
+                }
+            }
+            for (let y = 0; y < height; y += 1) {
+                for (let x = 0; x < width; x += 1) {
+                    let total = 0, count = 0;
+                    for (let offset = -radius; offset <= radius; offset += 1) {
+                        const sy = Math.min(height - 1, Math.max(0, y + offset));
+                        total += scratch[sy * width + x];
+                        count += 1;
+                    }
+                    target[y * width + x] = total / count;
+                }
+            }
+            read = target;
+        }
+    }
+
+    function sampleFloatField(field, width, height, x, y) {
+        const sx = Math.min(Math.max(x, 0), width - 1);
+        const sy = Math.min(Math.max(y, 0), height - 1);
+        const x0 = Math.floor(sx);
+        const y0 = Math.floor(sy);
+        const x1 = Math.min(x0 + 1, width - 1);
+        const y1 = Math.min(y0 + 1, height - 1);
+        const tx = sx - x0;
+        const ty = sy - y0;
+        const top = field[y0 * width + x0] * (1 - tx) + field[y0 * width + x1] * tx;
+        const bottom = field[y1 * width + x0] * (1 - tx) + field[y1 * width + x1] * tx;
+        return top * (1 - ty) + bottom * ty;
+    }
+
+    function greenSilkscreenColor(ink, paperNoise) {
+        const paper = { r: Math.round(245 - paperNoise * 255), g: Math.round(247 - paperNoise * 255), b: Math.round(242 - paperNoise * 255) };
+        const shadow = { r: 0, g: 179, b: 25 };
+        const deepShadow = { r: 0, g: 112, b: 31 };
+        let color = mixColor(paper, shadow, smoothStep(0.02, 0.86, ink));
+        color = mixColor(color, deepShadow, smoothStep(0.68, 1, ink) * 0.32);
+        return color;
+    }
+
+    function drawGreenPlaneFill(points, bounds) {
+        ctx.save();
+        makePath(points);
+        ctx.clip();
+        const gradient = ctx.createLinearGradient(bounds.left, bounds.top, bounds.right, bounds.bottom);
+        gradient.addColorStop(0, "#f5f7f2");
+        gradient.addColorStop(0.55, "#eef3e8");
+        gradient.addColorStop(1, "#dfead6");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+
+        ctx.globalCompositeOperation = "screen";
+        ctx.globalAlpha = 0.16;
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.ellipse(
+            bounds.left + (bounds.right - bounds.left) * 0.76,
+            bounds.top + (bounds.bottom - bounds.top) * 0.35,
+            Math.max(20, (bounds.right - bounds.left) * 0.28),
+            Math.max(12, (bounds.bottom - bounds.top) * 0.5),
+            -0.08, 0, Math.PI * 2
+        );
+        ctx.fill();
+
+        ctx.globalCompositeOperation = "multiply";
+        ctx.globalAlpha = 0.08;
+        ctx.fillStyle = "#00aa28";
+        ctx.beginPath();
+        ctx.ellipse(
+            bounds.left + (bounds.right - bounds.left) * 0.2,
+            bounds.top + (bounds.bottom - bounds.top) * 0.68,
+            Math.max(20, (bounds.right - bounds.left) * 0.34),
+            Math.max(12, (bounds.bottom - bounds.top) * 0.44),
+            -0.28, 0, Math.PI * 2
+        );
+        ctx.fill();
+        ctx.restore();
+    }
+
+    // ==== Red Filter ====
+    function drawRedHalftoneFilter(points, maskSample) {
+        const bounds = clampBounds(polygonBounds(points));
+        if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
+
+        const gap = Math.max(6, Math.min(canvas.width, canvas.height) * 0.01);
+        const sample = getBaseFrameSample(bounds);
+
+        ctx.save();
+        makePath(points);
+        ctx.clip();
+
+        ctx.globalCompositeOperation = "source-over";
+        ctx.fillStyle = "#fffefe";
+        ctx.fillRect(bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+
+        ctx.globalCompositeOperation = "source-over";
+        for (let y = bounds.top; y < bounds.bottom; y += gap) {
+            const rowOffset = Math.floor((y - bounds.top) / gap) % 2 === 0 ? 0 : gap * 0.5;
+            for (let x = bounds.left; x < bounds.right; x += gap) {
+                const px = x + rowOffset + (y - bounds.top) * 0.035;
+                if (!pointInPolygon({ x: px, y }, points)) continue;
+
+                const sx = Math.min(Math.max(Math.floor(((px - bounds.left) / (bounds.right - bounds.left)) * sample.width), 0), sample.width - 1);
+                const sy = Math.min(Math.max(Math.floor(((y - bounds.top) / (bounds.bottom - bounds.top)) * sample.height), 0), sample.height - 1);
+                const luma = sampleLuma(sample, sx, sy);
+                const subject = softPersonMaskAt(px, y, maskSample, gap * 1.25);
+                const maskStrength = smoothStep(0.16, 0.92, subject);
+                if (maskStrength <= 0) continue;
+
+                const contrastLuma = levels(luma, 0.18, 0.86);
+                const tone = Math.pow(1 - contrastLuma, 1.55);
+                const ink = tone * Math.pow(maskStrength, 1.45);
+                if (ink < 0.055) continue;
+
+                const keep = smoothStep(0.05, 0.52, ink);
+                if (dotNoise(px, y) > keep) continue;
+
+                const radius = gap * (0.012 + Math.pow(ink, 1.24) * 0.32);
+                const alpha = 0.24 + Math.pow(ink, 0.82) * 0.68;
+
+                ctx.fillStyle = `rgba(198, 14, 30, ${alpha})`;
+                ctx.beginPath();
+                ctx.arc(px, y, radius, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+        ctx.restore();
+    }
+
+    // ==== 主渲染循环 ====
+    function renderLoop() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // 1. 绘制背景原视频并缓存到 baseFrameCanvas 供滤镜采样
+        baseFrameCanvas.width = canvas.width;
+        baseFrameCanvas.height = canvas.height;
+        if (isCameraActive) {
+            baseFrameCtx.save();
+            baseFrameCtx.translate(canvas.width, 0);
+            baseFrameCtx.scale(-1, 1);
+            baseFrameCtx.drawImage(video, canvas.width - rX - rW, rY, rW, rH);
+            baseFrameCtx.restore();
+            ctx.drawImage(baseFrameCanvas, 0, 0);
+        } else {
+            baseFrameCtx.fillStyle = '#111';
+            baseFrameCtx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(baseFrameCanvas, 0, 0);
+        }
+
+        // 2. 获取当前人物遮罩样本
+        let maskSample = null;
+        if (latestMaskAvailable && maskCanvas.width > 0 && maskCanvas.height > 0) {
+            maskSample = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+        }
+
+        // 3. 获取控制点集
+        let pts = { l_thumb: null, l_index: null, l_middle: null, l_pinky: null,
+                    r_thumb: null, r_index: null, r_middle: null, r_pinky: null };
+
+        if (isDemoMode && demoPoints) {
+            pts = demoPoints;
+        } else if (latestHands.length >= 2) {
+            const h1_wrist = mapPoint(latestHands[0][0].x, latestHands[0][0].y);
+            const h2_wrist = mapPoint(latestHands[1][0].x, latestHands[1][0].y);
+            let leftHand, rightHand;
+            if (h1_wrist.x < h2_wrist.x) { leftHand = latestHands[0]; rightHand = latestHands[1]; } 
+            else { leftHand = latestHands[1]; rightHand = latestHands[0]; }
+
+            pts.l_thumb = mapPoint(leftHand[4].x, leftHand[4].y);
+            pts.l_index = mapPoint(leftHand[8].x, leftHand[8].y);
+            pts.l_middle = mapPoint(leftHand[12].x, leftHand[12].y);
+            pts.l_pinky = mapPoint(leftHand[20].x, leftHand[20].y);
+
+            pts.r_thumb = mapPoint(rightHand[4].x, rightHand[4].y);
+            pts.r_index = mapPoint(rightHand[8].x, rightHand[8].y);
+            pts.r_middle = mapPoint(rightHand[12].x, rightHand[12].y);
+            pts.r_pinky = mapPoint(rightHand[20].x, rightHand[20].y);
+        }
+
+        // 4. 渲染滤镜特效和保存可视的四边形用于描边
+        let visibleQuads = [];
+        if (pts.l_thumb) {
+            let redPts = [pts.l_thumb, pts.l_index, pts.r_index, pts.r_thumb];
+            let bluePts = [pts.l_index, pts.l_middle, pts.r_middle, pts.r_index];
+            let greenPts = [pts.l_middle, pts.l_pinky, pts.r_pinky, pts.r_middle];
+
+            if (redPts.every(p => p)) { drawRedHalftoneFilter(redPts, maskSample); visibleQuads.push(redPts); }
+            if (bluePts.every(p => p)) { drawBlueThermalFilter(bluePts, maskSample); visibleQuads.push(bluePts); }
+            if (greenPts.every(p => p)) { drawGreenGhostFilter(greenPts, maskSample); visibleQuads.push(greenPts); }
+        }
+
+        // 5. 绘制极细的半透明白色边框
+        ctx.save();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+        for (let points of visibleQuads) {
+            ctx.beginPath();
+            ctx.moveTo(points[0].x, points[0].y);
+            for (let i = 1; i < 4; i++) ctx.lineTo(points[i].x, points[i].y);
+            ctx.closePath();
+            ctx.stroke();
+        }
+        ctx.restore();
+
+        requestAnimationFrame(renderLoop);
+    }
+
+    // ==== 鼠标和触摸拖拽交互 (仅演示模式生效) ====
+    function getPointerPos(e) {
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        return { x: clientX, y: clientY };
+    }
+
+    function handlePointerDown(e) {
+        if (!isDemoMode || !demoPoints) return;
+        const pos = getPointerPos(e);
+        const threshold = 40;
+        draggedPoint = null;
+        let minDest = Infinity;
+        for (let key in demoPoints) {
+            const p = demoPoints[key];
+            const dist = Math.hypot(p.x - pos.x, p.y - pos.y);
+            if (dist < threshold && dist < minDest) {
+                minDest = dist;
+                draggedPoint = key;
+            }
+        }
+    }
+
+    function handlePointerMove(e) {
+        if (!isDemoMode || !draggedPoint) return;
+        e.preventDefault();
+        demoPoints[draggedPoint] = getPointerPos(e);
+    }
+
+    function handlePointerUp() { draggedPoint = null; }
+
+    canvas.addEventListener('mousedown', handlePointerDown);
+    canvas.addEventListener('mousemove', handlePointerMove);
+    window.addEventListener('mouseup', handlePointerUp);
+    canvas.addEventListener('touchstart', handlePointerDown, {passive: false});
+    canvas.addEventListener('touchmove', handlePointerMove, {passive: false});
+    window.addEventListener('touchend', handlePointerUp);
+
+    resizeCanvas();
+    ctx.fillStyle = '#111';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+});
+</script>
+</body>
+</html>

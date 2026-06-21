@@ -1,0 +1,10 @@
+.DS_Store
+Thumbs.db
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.*
+!.env.template
+public/config.local.json

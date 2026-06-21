@@ -1,0 +1,16 @@
+{
+  "name": "spatial-ar-gesture-demo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-platform AR hand gesture effects demo adapted from the uploaded Windows-only share package.",
+  "scripts": {
+    "setup": "npm install && npm run check",
+    "check": "node scripts/check-environment.mjs",
+    "start": "node scripts/serve.mjs",
+    "package": "node scripts/package.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
