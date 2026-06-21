@@ -41,15 +41,35 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnDemo = document.getElementById('btn-demo');
     const btnGroup = document.getElementById('btn-group');
     const statusPanel = document.getElementById('status-panel');
+    let lastStatusMessage = "";
 
     function showStatus(message) {
+        if (message === lastStatusMessage && !statusPanel.hidden) return;
+        lastStatusMessage = message;
         statusPanel.textContent = message;
         statusPanel.hidden = false;
     }
 
     function hideStatus() {
+        lastStatusMessage = "";
         statusPanel.hidden = true;
         statusPanel.textContent = "";
+    }
+
+    function updateTrackingStatus(visibleQuadsCount = 0) {
+        if (!isCameraActive) return;
+        if (visibleQuadsCount > 0) {
+            hideStatus();
+            return;
+        }
+
+        if (runtimeStats.lastInferenceError) {
+            showStatus(`模型推理异常：${runtimeStats.lastInferenceError}`);
+            return;
+        }
+
+        const maskText = runtimeStats.maskReady ? "人物遮罩已就绪" : "人物遮罩加载中";
+        showStatus(`摄像头已启动，${maskText}，已识别 ${runtimeStats.handCount}/2 只手。请让两只手同时完整进入画面。`);
     }
 
     // ==== 滤镜依赖的离屏缓冲区 ====
@@ -69,6 +89,11 @@ document.addEventListener('DOMContentLoaded', () => {
     
     let latestHands = [];
     let latestMaskAvailable = false;
+    const runtimeStats = {
+        handCount: 0,
+        maskReady: false,
+        lastInferenceError: "",
+    };
     
     // 渲染区域参数 (实现 object-fit: cover 效果)
     let rX=0, rY=0, rW=0, rH=0;
@@ -125,6 +150,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             handsModel.onResults((results) => {
                 latestHands = results.multiHandLandmarks || [];
+                runtimeStats.handCount = latestHands.length;
             });
 
             segmentationModel = new SelfieSegmentation({locateFile: (file) => skillRuntime.locateSegmentationFile(file)});
@@ -151,8 +177,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 maskCtx.drawImage(results.segmentationMask, canvas.width - rX - rW, rY, rW, rH);
                 maskCtx.restore();
                 latestMaskAvailable = true;
+                runtimeStats.maskReady = true;
             });
-            hideStatus();
+            showStatus("AI 技能模块已就绪，正在等待摄像头画面。");
         } catch (e) {
             console.error("AI 模型加载失败:", e);
             showStatus(`AI 技能模块加载失败：${e.message || e}`);
@@ -179,6 +206,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 btnGroup.style.opacity = '0';
                 setTimeout(() => btnGroup.style.display = 'none', 500);
                 resizeCanvas();
+                updateTrackingStatus();
                 processVideoLoop();
                 requestAnimationFrame(renderLoop);
             };
@@ -225,8 +253,11 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 await handsModel.send({image: video});
                 await segmentationModel.send({image: video});
+                runtimeStats.lastInferenceError = "";
             } catch (e) { 
                 console.warn("Model inference skip frame:", e); 
+                runtimeStats.lastInferenceError = e.message || String(e);
+                updateTrackingStatus();
             } finally {
                 isProcessing = false;
             }
@@ -839,6 +870,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (bluePts.every(p => p)) { drawBlueThermalFilter(bluePts, maskSample); visibleQuads.push(bluePts); }
             if (greenPts.every(p => p)) { drawGreenGhostFilter(greenPts, maskSample); visibleQuads.push(greenPts); }
         }
+
+        updateTrackingStatus(visibleQuads.length);
 
         // 5. 绘制极细的半透明白色边框
         ctx.save();
