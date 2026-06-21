@@ -40,7 +40,12 @@ git clone git@github.com:Beverly621/spatial-ar-gesture-demo.git
 cd spatial-ar-gesture-demo
 ```
 
-方式二：在 GitHub 页面点击 `Code` -> `Download ZIP`，解压后进入项目目录。
+方式二：下载压缩包。
+
+1. 在 GitHub 项目页面点击 `Code`。
+2. 选择 `Download ZIP` 下载压缩包。
+3. 解压 ZIP 文件。
+4. 进入解压后的项目目录，目录名可能是 `spatial-ar-gesture-demo-main`。
 
 ### 3. 初始化依赖
 
